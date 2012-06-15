@@ -32,6 +32,8 @@ public class AudioRecorderSimple extends Thread {
     private static class AudioFileWritingWorker extends Thread {
         private boolean mToBeEnd;
         private BlockingQueue<RecedAudioData> mQueue;
+        private File mFile;
+        private BufferedOutputStream mBos;
         public AudioFileWritingWorker( BlockingQueue<RecedAudioData> queue ) {
             mQueue = queue;
             mToBeEnd = false;
@@ -43,7 +45,7 @@ public class AudioRecorderSimple extends Thread {
         /**
          * ファイル名を表す String オブジェクトを作成する
          */
-        private String createFileName( Calendar calendar ) {
+        private File createNewNameFile( Calendar calendar ) {
             String fileName = "test";
             //Calendar calendar = Calendar.getInstance( TimeZone.getDefault() );
             String time = String.format( "%04d-%02d-%02d_%02d%02d%02d",
@@ -53,8 +55,16 @@ public class AudioRecorderSimple extends Thread {
                     calendar.get( Calendar.HOUR ),
                     calendar.get( Calendar.MINUTE ),
                     calendar.get( Calendar.SECOND ) );
-            fileName += "_" + time + ".wav";
-            return fileName;
+            fileName += "_" + time;
+            String fnp = fileName;
+            fileName = fnp + ".wav";
+            File file = null;
+            for ( int i = 0; i < 1024; ++ i ) {
+                file = new File( fileName );
+                if ( ! file.exists() ) break;
+                fileName = fnp + "_" + i + ".wav";
+            }
+            return file;
         }
         private void putFileHeader( BufferedOutputStream bos ) throws IOException {
             // ヘッダーの定義
@@ -78,16 +88,55 @@ public class AudioRecorderSimple extends Thread {
             // ヘッダーの出力
             bos.write( header );
         }
+        private static String TMP_FILE_NAME = "__writing__.wav";
+        private void startFile() throws IOException {
+            System.out.println( "ファイル作成" );
+            // TODO 時刻は取得時の時刻にする
+            mFile = new File( TMP_FILE_NAME );//createFileName( Calendar.getInstance( TimeZone.getDefault() ) ) );
+            mBos = new BufferedOutputStream( new FileOutputStream( mFile ) );
+            putFileHeader( mBos );
+        }
+        private void endFile( long dataSize ) throws IOException {
+            try {
+                writeHeaderToFile( dataSize );
+            } finally {
+                if ( mBos != null ) mBos.close();
+            }
+            mFile.renameTo( createNewNameFile( Calendar.getInstance() ) );
+        }
+        private void writeHeaderToFile( long dataSize ) throws IOException {
+            // ファイルサイズの書き込み
+            RandomAccessFile raf = null;
+            try {
+                raf = new RandomAccessFile( mFile, "rw" );
+                byte[] dataSizeBytes = new byte[4];
+                // 40 のところに dataSize
+                raf.seek(40);
+                dataSizeBytes[0] = (byte)( dataSize & 0xFF );
+                dataSizeBytes[1] = (byte)((dataSize >> 8)  & 0xFF );
+                dataSizeBytes[2] = (byte)((dataSize >> 16) & 0xFF );
+                dataSizeBytes[3] = (byte)((dataSize >> 24) & 0xFF );
+                raf.write(dataSizeBytes);
+                // 4 のところに dataSize + 36
+                raf.seek(4);
+                dataSize += 36;
+                dataSizeBytes[0] = (byte)( dataSize & 0xFF );
+                dataSizeBytes[1] = (byte)((dataSize >> 8)  & 0xFF );
+                dataSizeBytes[2] = (byte)((dataSize >> 16) & 0xFF );
+                dataSizeBytes[3] = (byte)((dataSize >> 24) & 0xFF );
+                raf.write(dataSizeBytes);
+            } finally {
+                if ( raf != null ) raf.close();
+            }
+        }
         @Override
         public void run() {
             byte[] buf = new byte[4096];
             Calendar lastPolled = Calendar.getInstance();
             while ( true ) {
-                // ファイルの変数
-                File file = null;
-                BufferedOutputStream bos = null;
+                long dataSize = 0; // 波形データのバイト数
                 try {
-                    long dataSize = 0; // 波形データのバイト数
+                    startFile();
                     while ( true ) {
                         RecedAudioData data = null;
                         try {
@@ -98,7 +147,8 @@ public class AudioRecorderSimple extends Thread {
                         }
                         if ( data == null ) {
                             // 最期に書き込んだデータの日時などを見て, 時間が過ぎまくっているなら例外出して終わる
-                            if ( Calendar.getInstance().getTimeInMillis() - lastPolled.getTimeInMillis() > 5000 ) {
+                            if ( Calendar.getInstance().getTimeInMillis() - lastPolled.getTimeInMillis() > 10000 ) {
+                                System.err.println( "[ERROR] 時間超過" ); // TODO
                                 break;
                             }
                             // 特に問題ないなら次へ
@@ -106,61 +156,25 @@ public class AudioRecorderSimple extends Thread {
                             else            continue;
                         }
                         lastPolled = data.time;
-                        // ファイルが存在しないならファイルを作成
-                        if ( file == null ) {
-                            System.out.println( "ファイル作成" );
-                            // TODO 時刻は取得時の時刻にする
-                            file = new File( createFileName( Calendar.getInstance( TimeZone.getDefault() ) ) );
-                            bos = new BufferedOutputStream( new FileOutputStream( file ) );
-                            putFileHeader( bos );
-                        }
                         // 波形データの出力
                         while( true ) {
-                            int readLength = data.stream.read( buf );
-                            if( readLength <= 0 ) {
-                                break;
+                            try {
+                                int readLength = data.stream.read( buf );
+                                if( readLength <= 0 ) break;
+                                dataSize += readLength;
+                                mBos.write( buf, 0, readLength );
+                            } catch ( IOException err ) {
+                                err.printStackTrace();
                             }
-                            dataSize += readLength;
-                            bos.write( buf, 0, readLength );
                         }
-                        //AudioSystem.write( mAudioInputStream, mTargetType, mOutputFile );
-                        // ファイルに書き込む処理
                         if ( mToBeEnd ) break;
                         // 指定の条件 (ファイルサイズとか) に達した場合は break する
-                        if( dataSize > 102400000 ) break;
+                        //if( dataSize > 1048576 ) break;
+                        if( dataSize > 80000000 ) break;
                     }
-
-                    // ファイルサイズの書き込み
-                    RandomAccessFile raf = null;
-                    try {
-                        raf = new RandomAccessFile( file, "rw" );
-                        byte[] dataSizeBytes = new byte[4];
-                        // 40 のところに dataSize
-                        raf.seek(40);
-                        dataSizeBytes[0] = (byte)( dataSize & 0xFF );
-                        dataSizeBytes[1] = (byte)((dataSize >> 8)  & 0xFF );
-                        dataSizeBytes[2] = (byte)((dataSize >> 16) & 0xFF );
-                        dataSizeBytes[3] = (byte)((dataSize >> 24) & 0xFF );
-                        raf.write(dataSizeBytes);
-                        // 4 のところに dataSize + 36
-                        raf.seek(4);
-                        dataSize += 36;
-                        dataSizeBytes[0] = (byte)( dataSize & 0xFF );
-                        dataSizeBytes[1] = (byte)((dataSize >> 8)  & 0xFF );
-                        dataSizeBytes[2] = (byte)((dataSize >> 16) & 0xFF );
-                        dataSizeBytes[3] = (byte)((dataSize >> 24) & 0xFF );
-                        raf.write(dataSizeBytes);
-                    } finally {
-                        if ( raf != null ) raf.close();
-                    }
+                    endFile( dataSize );
                 } catch ( IOException err ) {
                     err.printStackTrace();
-                } finally {
-                    try {
-                        if ( bos != null ) bos.close();
-                    } catch ( IOException err ) {
-                        err.printStackTrace();
-                    }
                 }
                 if ( mToBeEnd ) break;
             }
